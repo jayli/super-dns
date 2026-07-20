@@ -1,6 +1,6 @@
 {
   "name": "super-dns",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "真实 dns，防劫持用的",
   "homepage": "https://github.com/jayli/super-dns#readme",
   "bugs": {

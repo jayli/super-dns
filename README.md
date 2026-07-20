@@ -12,42 +12,31 @@
 
 ## 快速开始
 
+### 方式一：npx 直接运行（无需安装）
+
 ```bash
-# 本地开发测试
-npm start
-# 或
-node index.js
+npx super-dns
+```
+
+### 方式二：全局安装
+
+```bash
+npm install -g super-dns
+super-dns
 ```
 
 首次启动会自动创建配置文件 `~/.config/super-dns/domains`，并弹出密码框配置 macOS 独立解析器。
 
-## 生产环境部署
-
-使用 pm2 + npx 实现进程守护和自动重启：
+### 方式三：pm2 守护进程（推荐生产使用）
 
 ```bash
-# 1. 发布到 npm（首次）
-npm publish
-
-# 2. 用 pm2 启动
+# 用 pm2 启动
 pm2 start npx --name super-dns -- super-dns
 
-# 3. 保存进程列表
+# 保存进程列表
 pm2 save
 
-# 4. 设置开机自启（按提示执行输出的命令）
-pm2 startup
-```
-
-或者全局安装后启动：
-
-```bash
-# 全局安装
-npm install -g super-dns
-
-# pm2 启动
-pm2 start super-dns --name super-dns
-pm2 save
+# 设置开机自启（按提示执行输出的命令）
 pm2 startup
 ```
 
