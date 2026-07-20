@@ -86,3 +86,4 @@ example.com
 - `Ctrl+C` (SIGINT) 或 `kill` (SIGTERM) 触发优雅退出
 - 自动删除 `/etc/resolver/` 下的配置文件
 - 可能需要输入一次密码（osascript 弹窗）
+

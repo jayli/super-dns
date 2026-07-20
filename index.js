@@ -4,7 +4,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { fork } = require('child_process');
 
 // ============================================================
 // 配置
@@ -81,15 +81,6 @@ function getResolverDomains() {
 // ============================================================
 const RESOLVER_DIR = '/etc/resolver';
 let resolverConfigured = false;
-
-function sudoExec(command) {
-  // 直接用 osascript 弹窗执行（管理员权限），避免 sudo 需要终端的问题
-  const escaped = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  execSync(
-    `osascript -e 'do shell script "${escaped}" with administrator privileges'`,
-    { stdio: 'pipe', timeout: 120000 }
-  );
-}
 
 // ============================================================
 // 缓存
@@ -427,7 +418,19 @@ server.on('listening', () => {
         commands.push('chown ' + currentUser + ' ' + resolverFile);
       }
       sudoExec(commands.join(' && '));
+
+      // 验证 chown 是否生效，确保退出时 unlinkSync 能直接删除
       for (const domain of resolverDomains) {
+        const resolverFile = RESOLVER_DIR + '/' + domain;
+        try {
+          const stat = fs.statSync(resolverFile);
+          const owner = require('os').userInfo().uid;
+          if (stat.uid !== owner) {
+            process.send({ type: 'setup-warn', domain, error: 'chown 未生效 (uid=' + stat.uid + ', 期望=' + owner + ')，退出时可能需要手动清理' });
+          }
+        } catch (statErr) {
+          // 忽略 stat 错误
+        }
         process.send({ type: 'setup-ok', domain });
       }
       process.send({ type: 'setup-done' });
@@ -436,7 +439,7 @@ server.on('listening', () => {
     }
   `;
 
-  const setupChild = require('child_process').fork(`-e`, [setupScript], {
+  const setupChild = fork(`-e`, [setupScript], {
     silent: true,
     detached: false
   });
@@ -444,6 +447,8 @@ server.on('listening', () => {
   setupChild.on('message', (msg) => {
     if (msg.type === 'setup-ok') {
       console.log(`    ✓ ${RESOLVER_DIR}/${msg.domain} → ${addr.address}:${addr.port}`);
+    } else if (msg.type === 'setup-warn') {
+      console.warn(`    ⚠ ${RESOLVER_DIR}/${msg.domain}: ${msg.error}`);
     } else if (msg.type === 'setup-done') {
       resolverConfigured = true;
       console.log('[*] macOS 解析器配置完成');
@@ -490,14 +495,10 @@ function shutdown(signal) {
         fs.unlinkSync(resolverFile);
         console.log(`    ✓ 已删除 ${resolverFile}`);
       } catch (e) {
-        // 如果直接删不了（比如权限被改回去），用 osascript
-        try {
-          sudoExec(`rm -f ${resolverFile}`);
-          console.log(`    ✓ 已删除 ${resolverFile} (sudo)`);
-        } catch (e2) {
-          console.error(`    ✗ 删除 ${resolverFile} 失败: ${e.message}`);
-          console.error(`    请手动执行: sudo rm ${resolverFile}`);
-        }
+        // pm2 等进程管理器 kill_timeout 很短，osascript 弹密码框来不及输入就会被 SIGKILL
+        // 不弹框，改为提示手动清理
+        console.error(`    ✗ 删除 ${resolverFile} 失败: ${e.message}`);
+        console.error(`    请手动执行: sudo rm ${resolverFile}`);
       }
     }
   }
