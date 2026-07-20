@@ -1,0 +1,24 @@
+{
+  "name": "super-dns",
+  "version": "1.0.0",
+  "description": "真实 dns，防劫持用的",
+  "homepage": "https://github.com/jayli/super-dns#readme",
+  "bugs": {
+    "url": "https://github.com/jayli/super-dns/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jayli/super-dns.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "bin": {
+    "super-dns": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}
