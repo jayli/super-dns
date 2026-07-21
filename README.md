@@ -1,6 +1,6 @@
 # Super DNS
 
-macOS 本机 hosts 维护守护进程。它通过 DoH 解析指定域名，并维护 `/etc/hosts` 中由 super-dns 管理的记录，避免目标域名被本机其他 DNS 模块抢答污染。
+macOS 本机 hosts 维护守护进程。它通过 DoH 解析指定域名的 A/AAAA 记录，并维护 `/etc/hosts` 中由 super-dns 管理的 IPv4/IPv6 记录，避免目标域名被本机其他 DNS 模块抢答污染。
 
 ## 安装后命令
 
@@ -66,6 +66,7 @@ c.com
 ```text
 # BEGIN super-dns
 1.2.3.4 a.com
+2606:4700:3031::6815:33a3 a.com
 # END super-dns
 ```
 
@@ -73,12 +74,14 @@ c.com
 
 1. 读取 `~/.config/super-dns/domains`
 2. 跳过通配符，保留精确域名
-3. 通过 DoH 查询 A 记录
+3. 通过 DoH 查询 A 和 AAAA 记录
 4. 结果变化时更新 `/etc/hosts`
 5. 执行 `dscacheutil -flushcache`
 6. 执行 `killall -HUP mDNSResponder`
 
 默认每 300 秒轮询一次。配置文件发生变化后，会立即触发一次更新。
+
+如果域名存在 IPv6 解析，程序也会写入对应 AAAA 地址。这样可以避免系统或浏览器优先选择 IPv6 时绕过 IPv4 hosts 记录。
 
 ## 日志
 
@@ -97,4 +100,3 @@ super-dns stop
 ```
 
 程序收到 `SIGINT` 或 `SIGTERM` 后，会清理 `/etc/hosts` 中的 super-dns 区块并刷新 DNS 缓存。
-

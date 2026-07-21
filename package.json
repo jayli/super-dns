@@ -1,7 +1,7 @@
 {
   "name": "super-dns",
-  "version": "2.0.1",
-  "description": "系统级 DNS 代理，白名单域名走 DoH 防劫持，其余透传上游 DNS",
+  "version": "2.0.2",
+  "description": "DNS 代理，白名单域名走 DoH 防劫持，其余透传上游 DNS",
   "homepage": "https://github.com/jayli/super-dns#readme",
   "bugs": {
     "url": "https://github.com/jayli/super-dns/issues"

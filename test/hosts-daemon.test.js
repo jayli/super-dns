@@ -85,10 +85,21 @@ test('removes managed hosts records when the daemon stops', () => {
 });
 
 test('uses doh to resolve exact domains and skips wildcard hosts entries', () => {
-  assert.match(source, /function dohQueryA/);
+  assert.match(source, /function dohQuery/);
+  assert.match(source, /dohQuery\(domain, 'A'\)/);
+  assert.match(source, /dohQuery\(domain, 'AAAA'\)/);
+  assert.match(source, /A: 1/);
+  assert.match(source, /AAAA: 28/);
+  assert.match(source, /net\.isIP\(answer\.data\) === ipVersion/);
   assert.match(source, /wildcard/);
   assert.match(source, /跳过通配符/);
   assert.match(source, /exactDomains/);
+});
+
+test('writes both ipv4 and ipv6 records to hosts', () => {
+  assert.match(source, /Promise\.all\(\[\s*dohQuery\(domain, 'A'\),\s*dohQuery\(domain, 'AAAA'\)\s*\]\)/);
+  assert.match(source, /const ips = uniqueIps\(\[\.\.\.ipv4, \.\.\.ipv6\]\)/);
+  assert.match(source, /for \(const ip of ips\) {\n      lines\.push\(`\$\{ip\} \$\{domain\}`\);/);
 });
 
 test('prints startup status including root identity and loaded domains', () => {

@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const util = require('util');
+const net = require('net');
 const { execSync } = require('child_process');
 
 const DOH_BASE = process.env.DOH_BASE || 'https://dns.alidns.com/resolve';
@@ -530,9 +531,23 @@ function loadDomains() {
   for (const domain of wildcardDomains) console.log(`    - ${domain} (跳过通配符 hosts 条目)`);
 }
 
-function dohQueryA(domain) {
+function uniqueIps(ips) {
+  return [...new Set(ips)];
+}
+
+function dohQuery(domain, type) {
   return new Promise((resolve, reject) => {
-    const url = `${DOH_BASE}?name=${encodeURIComponent(domain)}&type=A`;
+    const recordTypes = { A: 1, AAAA: 28 };
+    const ipVersions = { A: 4, AAAA: 6 };
+    const recordType = recordTypes[type];
+    const ipVersion = ipVersions[type];
+
+    if (!recordType || !ipVersion) {
+      reject(new Error(`不支持的 DoH 记录类型: ${type}`));
+      return;
+    }
+
+    const url = `${DOH_BASE}?name=${encodeURIComponent(domain)}&type=${type}`;
     const req = https.get(url, { timeout: 8000 }, (res) => {
       let body = '';
       res.on('data', chunk => body += chunk);
@@ -541,11 +556,11 @@ function dohQueryA(domain) {
           const json = JSON.parse(body);
           const ips = [];
           for (const answer of json.Answer || []) {
-            if (answer.type === 1 && typeof answer.data === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(answer.data)) {
+            if (answer.type === recordType && typeof answer.data === 'string' && net.isIP(answer.data) === ipVersion) {
               ips.push(answer.data);
             }
           }
-          resolve([...new Set(ips)]);
+          resolve(uniqueIps(ips));
         } catch (e) {
           reject(new Error(`DoH JSON 解析失败: ${e.message}`));
         }
@@ -662,13 +677,19 @@ async function resolveExactDomains() {
 
   for (const domain of exactDomains) {
     try {
-      const ips = await dohQueryA(domain);
+      const [ipv4, ipv6] = await Promise.all([
+        dohQuery(domain, 'A'),
+        dohQuery(domain, 'AAAA')
+      ]);
+      const ips = uniqueIps([...ipv4, ...ipv6]);
       if (ips.length === 0) {
-        console.log(`[!] ${domain} 没有 A 记录`);
+        console.log(`[!] ${domain} 没有 A/AAAA 记录`);
         continue;
       }
       records.set(domain, ips);
-      console.log(`[✓] ${domain} -> ${ips.join(', ')}`);
+      console.log(`[✓] ${domain} A -> ${ipv4.length ? ipv4.join(', ') : '无'}`);
+      console.log(`[✓] ${domain} AAAA -> ${ipv6.length ? ipv6.join(', ') : '无'}`);
+      console.log(`[✓] ${domain} hosts -> ${ips.join(', ')}`);
     } catch (e) {
       console.error(`[!] ${domain} DoH 查询失败: ${e.message}`);
       const stale = currentHosts.get(domain);

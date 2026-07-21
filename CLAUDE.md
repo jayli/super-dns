@@ -6,7 +6,7 @@ This file provides guidance when working with this repository.
 
 Super DNS is a macOS `/etc/hosts` maintenance daemon. It no longer runs a DNS proxy, does not listen on port 53, does not use pf, and does not change system DNS servers.
 
-The foreground command is a small CLI controller. When administrator permission is needed, it uses `osascript ... with administrator privileges` to show the macOS authorization dialog, then starts a root background daemon. The daemon resolves exact domains from `~/.config/super-dns/domains` through Alibaba Cloud DoH and writes the results into a managed `/etc/hosts` block.
+The foreground command is a small CLI controller. When administrator permission is needed, it uses `osascript ... with administrator privileges` to show the macOS authorization dialog, then starts a root background daemon. The daemon resolves exact domains from `~/.config/super-dns/domains` through Alibaba Cloud DoH and writes IPv4/IPv6 results into a managed `/etc/hosts` block.
 
 ## Commands
 
@@ -74,7 +74,7 @@ The detailed timestamped output is written to `/tmp/super-dns.log`.
 - colored terminal status output using ANSI escape codes, with plain output for non-TTY
 - 500-line bounded logger writing `/tmp/super-dns.log`
 - domain file loading from `~/.config/super-dns/domains`
-- DoH A-record lookup
+- DoH A/AAAA-record lookup
 - `/etc/hosts` managed block replacement
 - DNS cache flushing
 - 300-second polling by default
@@ -90,8 +90,11 @@ The daemon owns only this block:
 ```text
 # BEGIN super-dns
 221.223.177.133 perf.qzz.io
+2606:4700:3031::6815:33a3 996.perf.qzz.io
 # END super-dns
 ```
+
+When a domain has AAAA records, the daemon writes IPv6 hosts lines as well. This prevents clients that prefer IPv6 from bypassing the IPv4 hosts override.
 
 Do not edit or rewrite unrelated parts of `/etc/hosts`.
 
@@ -139,4 +142,5 @@ Tests are source-level behavior guards in `test/`:
 - Hosts block management exists
 - Poll interval is 300 seconds
 - Domain file changes trigger immediate update
+- A and AAAA records are both queried and written
 - Log file is capped at 500 lines
