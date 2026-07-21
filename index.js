@@ -377,7 +377,7 @@ function parseRequest(buf) {
     name: name.toLowerCase(),
     qtype,
     qclass,
-    questionRaw: buf.slice(12, nextOffset + 4)
+    questionRaw: Buffer.from(buf.subarray(12, nextOffset + 4))
   };
 }
 
@@ -463,7 +463,14 @@ function buildResponse(req, ips) {
     qdCount[2] = 0; qdCount[3] = 0;
   }
 
-  return Buffer.concat([id, flags, qdCount, question, ...answers]);
+  const full = Buffer.concat([id, flags, qdCount, question, ...answers]);
+  // DEBUG: check actual IP bytes in answer
+  if (answers.length > 0) {
+    const ansHex = [];
+    for (let i = 0; i < answers[0].length; i++) ansHex.push(answers[0][i].toString(16).padStart(2, '0'));
+    console.log(`[DEBUG] buildResponse answer hex: ${ansHex.join(' ')}`);
+  }
+  return full;
 }
 
 // ============================================================
@@ -527,7 +534,14 @@ server.on('message', async (msg, rinfo) => {
     } else {
       console.log(`[!] DoH 无记录`);
     }
-    server.send(buildResponse(req, ips), rinfo.port, rinfo.address);
+    // 用 debug 脚本检查实际发出的报文
+    const response = buildResponse(req, ips);
+    // DEBUG: hex dump of the IP portion
+    const dbg = [];
+    for (let i = 0; i < response.length; i++) dbg.push(response[i].toString(16).padStart(2, '0'));
+    console.log(`[DEBUG] response hex (${response.length}B): ${dbg.join(' ')}`);
+    console.log(`[DEBUG] ips passed to buildResponse: [${ips}]`);
+    server.send(response, rinfo.port, rinfo.address);
   } catch (e) {
     console.error(`[!] DoH 查询失败: ${e.message}`);
     const stale = cache.get(cacheKey(cleanName, req.qtype));
