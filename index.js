@@ -4,7 +4,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync, spawn } = require('child_process');
+const { execSync } = require('child_process');
 
 // ============================================================
 // 配置
@@ -19,12 +19,29 @@ const DOMAINS_FILE = path.join(CONFIG_DIR, 'domains');
 // ============================================================
 // Root 提权
 // ============================================================
+const ELEVATE_LOCK = '/tmp/super-dns-elevate.lock';
+
 function ensureRoot() {
+  // 已经是 root，清理可能残留的锁文件后直接返回
   try {
-    if (process.getuid() === 0) return;
+    if (process.getuid() === 0) {
+      try { fs.unlinkSync(ELEVATE_LOCK); } catch (_) { /* ignore */ }
+      return;
+    }
   } catch (e) {
     return; // getuid not available
   }
+
+  // 锁文件检查：防止 pm2 反复重启导致多次弹框
+  if (fs.existsSync(ELEVATE_LOCK)) {
+    const lockAge = Date.now() - fs.statSync(ELEVATE_LOCK).mtimeMs;
+    if (lockAge < 30000) {
+      console.log('[*] 已有提权进程在处理中，退出等待');
+      process.exit(0);
+    }
+    try { fs.unlinkSync(ELEVATE_LOCK); } catch (_) { /* stale lock */ }
+  }
+  fs.writeFileSync(ELEVATE_LOCK, String(process.pid));
 
   console.log('[*] 需要 root 权限监听 53 端口，正在请求授权...');
 
@@ -41,29 +58,30 @@ function ensureRoot() {
     .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
     .join('\n');
 
-  const shellScript = `#!/bin/bash\n${envLines}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)}`;
+  // 用 nohup & 后台化而非 exec，让 osascript 能正常返回
+  // 这样 execSync 不会永久阻塞，pm2 也不会反复重启弹框
+  const shellScript = `#!/bin/bash\n${envLines}\nnohup ${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)} > /tmp/super-dns.log 2>&1 &\nrm -f ${ELEVATE_LOCK}`;
 
   const tmpFile = `/tmp/super-dns-elevate-${process.pid}.sh`;
   fs.writeFileSync(tmpFile, shellScript, { mode: 0o700 });
 
   try {
-    // 用 spawn detached 避免阻塞：父进程立即退出，osascript 启动的 root 子进程接管
-    const child = spawn('osascript', [
-      '-e', `do shell script "bash ${tmpFile}" with administrator privileges`
-    ], {
-      detached: true,
-      stdio: 'ignore'
-    });
-    child.unref();
+    execSync(
+      `osascript -e 'do shell script "bash ${tmpFile}" with administrator privileges'`,
+      { stdio: 'inherit' }
+    );
   } catch (e) {
     console.error('[!] 授权失败或已取消:', e.message);
     try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
+    try { fs.unlinkSync(ELEVATE_LOCK); } catch (_) { /* ignore */ }
     process.exit(1);
   }
 
-  // 父进程退出，root 子进程已通过 osascript 启动
-  // tmpFile 由子进程读取后由系统清理 /tmp
-  setTimeout(() => process.exit(0), 200);
+  try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
+
+  // osascript 执行完毕，root 子进程已在后台运行
+  console.log('[*] Root 子进程已启动 (日志: /tmp/super-dns.log)');
+  process.exit(0);
 }
 
 // ============================================================
