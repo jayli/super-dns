@@ -1,7 +1,7 @@
 {
   "name": "super-dns",
-  "version": "1.0.1",
-  "description": "真实 dns，防劫持用的",
+  "version": "2.0.0",
+  "description": "系统级 DNS 代理，白名单域名走 DoH 防劫持，其余透传上游 DNS",
   "homepage": "https://github.com/jayli/super-dns#readme",
   "bugs": {
     "url": "https://github.com/jayli/super-dns/issues"
@@ -18,7 +18,7 @@
     "super-dns": "index.js"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "sudo node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   }
 }

@@ -408,15 +408,6 @@ function buildResponse(req, ips) {
   return Buffer.concat([id, flags, qdCount, question, ...answers]);
 }
 
-function buildNxDomain(req) {
-  const id = Buffer.alloc(2);
-  id.writeUInt16BE(req.id, 0);
-  const flags = Buffer.alloc(2);
-  flags.writeUInt16BE(0x8183, 0);
-  const counts = Buffer.from([0, 1, 0, 0, 0, 0, 0, 0]);
-  return Buffer.concat([id, flags, counts, req.questionRaw]);
-}
-
 // ============================================================
 // 域名匹配（支持通配符）
 // ============================================================
@@ -508,6 +499,16 @@ server.on('listening', () => {
   console.log(`[*] 上游 DNS: ${UPSTREAM_DNS}`);
   console.log(`[*] 配置: ${DOMAINS_FILE}`);
   console.log('');
+
+  // 设置系统 DNS 为本地代理
+  try {
+    execSync(`networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.1`, { timeout: 10000 });
+    console.log(`[*] 已将 ${NETWORK_INTERFACE} DNS 设置为 127.0.0.1`);
+  } catch (e) {
+    console.error(`[!] 设置系统 DNS 失败: ${e.message}`);
+    console.error(`[!] 请手动执行: sudo networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.1`);
+  }
+  console.log('');
 });
 
 // ============================================================
@@ -521,10 +522,23 @@ function shutdown(signal) {
 
   console.log(`\n[*] 收到 ${signal}，正在关闭...`);
 
+  // 关闭上游 socket
+  try { upstreamSocket.close(); } catch (_) { /* ignore */ }
+
   // 关闭 DNS 服务器
   server.close(() => {
     console.log('[*] DNS 服务已关闭');
   });
+
+  // 恢复系统 DNS
+  try {
+    execSync(`networksetup -setdnsservers "${NETWORK_INTERFACE}" Empty`, { timeout: 10000 });
+    console.log(`[*] 已恢复 ${NETWORK_INTERFACE} DNS 为默认`);
+  } catch (e) {
+    console.error(`[!] 恢复系统 DNS 失败: ${e.message}`);
+    console.error(`[!] 请手动执行: sudo networksetup -setdnsservers "${NETWORK_INTERFACE}" Empty`);
+    console.error(`    或: networksetup -setdnsservers "${NETWORK_INTERFACE}" <原来的DNS>`);
+  }
 
   console.log('[*] 已关闭');
   process.exit(0);
