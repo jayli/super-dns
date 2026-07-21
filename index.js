@@ -580,9 +580,29 @@ function stripHostsBlock(content) {
   return content.replace(pattern, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
 }
 
+function stripManagedDomainLines(content, domains) {
+  const managed = new Set([...domains].map(domain => domain.toLowerCase()));
+  if (managed.size === 0) return content;
+
+  return content
+    .split('\n')
+    .filter(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (trimmed.startsWith('#')) return true; // 保留注释行
+
+      const fields = trimmed.split(/\s+/);
+      const names = fields.slice(1).map(name => name.toLowerCase());
+      return !names.some(name => managed.has(name));
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trimEnd();
+}
+
 function updateHostsBlock(records) {
   const existing = fs.readFileSync(HOSTS_FILE, 'utf-8');
-  const base = stripHostsBlock(existing);
+  const base = stripManagedDomainLines(stripHostsBlock(existing), records.keys());
   const block = buildHostsBlock(records);
   const next = `${base ? `${base}\n\n` : ''}${block}\n`;
 

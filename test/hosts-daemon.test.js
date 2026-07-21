@@ -59,6 +59,12 @@ test('manages only its own hosts block', () => {
   assert.match(source, /function removeHostsBlock/);
 });
 
+test('deduplicates managed domains outside the hosts block before writing', () => {
+  assert.match(source, /function stripManagedDomainLines/);
+  assert.match(source, /stripManagedDomainLines\(stripHostsBlock\(existing\), records\.keys\(\)\)/);
+  assert.match(source, /保留注释行/);
+});
+
 test('polls doh every 300 seconds and reacts to domain file changes', () => {
   assert.match(source, /const POLL_INTERVAL_MS = parseInt\(process\.env\.POLL_INTERVAL \|\| '300000', 10\);/);
   assert.match(source, /setInterval\(runUpdateCycle, POLL_INTERVAL_MS\)/);
