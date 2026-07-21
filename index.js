@@ -10,7 +10,7 @@ const { execSync } = require('child_process');
 // 配置
 // ============================================================
 const PORT = parseInt(process.env.PORT || '53', 10);
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '127.0.0.2';
 const DOH_BASE = process.env.DOH_BASE || 'https://dns.alidns.com/resolve';
 const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL || '300000', 10); // 5 min
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'super-dns');
@@ -234,7 +234,7 @@ function forwardToUpstream(msg, rinfo) {
 // ============================================================
 // DoH 查询 (阿里云公共 DNS)
 // ============================================================
-// https.get 内部 dns.lookup 会走系统 DNS → 127.0.0.1 → 代理不匹配白名单 → 透传到上游
+// https.get 内部 dns.lookup 走系统 DNS → 代理 → 不匹配白名单 → 透传到上游
 function dohQuery(name, type) {
   return new Promise((resolve, reject) => {
     const qtype = type === 28 ? 'AAAA' : 'A';
@@ -503,11 +503,11 @@ server.on('listening', () => {
 
   // 设置系统 DNS 为本地代理
   try {
-    execSync(`networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.1`, { timeout: 10000 });
-    console.log(`[*] 已将 ${NETWORK_INTERFACE} DNS 设置为 127.0.0.1`);
+    execSync(`networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.2`, { timeout: 10000 });
+    console.log(`[*] 已将 ${NETWORK_INTERFACE} DNS 设置为 127.0.0.2`);
   } catch (e) {
     console.error(`[!] 设置系统 DNS 失败: ${e.message}`);
-    console.error(`[!] 请手动执行: sudo networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.1`);
+    console.error(`[!] 请手动执行: sudo networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.2`);
   }
   console.log('');
 });

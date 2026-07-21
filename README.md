@@ -72,7 +72,7 @@ example.com
 ## 工作原理
 
 1. 以 root 权限监听 UDP 53 端口
-2. 通过 `networksetup` 将系统 DNS 设置为 `127.0.0.1`
+2. 通过 `networksetup` 将系统 DNS 设置为 `127.0.0.2`（避开 mDNSResponder）
 3. 所有本机 DNS 请求路由到本地代理
 4. 命中白名单的域名 → 阿里云 DoH 解析 → 缓存 → 返回
 5. 未命中的域名 → UDP 原样转发到上游 DNS → 返回

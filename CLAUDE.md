@@ -15,8 +15,8 @@ sudo node index.js
 npm start
 
 # Test DNS resolution
-dig @127.0.0.1 -p 53 perf.qzz.io A +short
-dig @127.0.0.1 -p 53 baidu.com A +short
+dig @127.0.0.2 -p 53 perf.qzz.io A +short
+dig @127.0.0.2 -p 53 baidu.com A +short
 
 # Verify system DNS is pointed to local proxy
 scutil --dns | head -20
@@ -49,7 +49,8 @@ curl -k https://perf.qzz.io:8443/
 - Lock file (`/tmp/super-dns-elevate.lock`) prevents repeated elevation dialogs
 - Shell script uses `nohup &` so osascript returns and parent exits cleanly
 - Hand-rolled DNS protocol implementation (no external DNS library)
-- `networksetup -setdnsservers` replaces `/etc/resolver` — entire system DNS points to 127.0.0.1
+- Binds to `127.0.0.2:53` to avoid conflicting with macOS `mDNSResponder` on `127.0.0.1:53`
+- `networksetup -setdnsservers` replaces `/etc/resolver` — entire system DNS points to 127.0.0.2
 
 **Configuration file**: `~/.config/super-dns/domains`
 - One domain per line, supports `#` comments
@@ -68,7 +69,7 @@ curl -k https://perf.qzz.io:8443/
 
 **Port 53 requires root**: On first launch a macOS GUI password dialog appears. The elevated process runs `nohup` in background and logs to `/tmp/super-dns.log`.
 
-**System DNS via networksetup**: On startup, `networksetup -setdnsservers <iface> 127.0.0.1` redirects all system DNS to the proxy. On exit, `networksetup -setdnsservers <iface> Empty` restores the default. This replaces the old per-domain `/etc/resolver/` approach entirely.
+**System DNS via networksetup**: On startup, `networksetup -setdnsservers <iface> 127.0.0.2` redirects all system DNS to the proxy (using `127.0.0.2` to avoid mDNSResponder's `127.0.0.1` binding).
 
 **Upstream DNS forwarding**: Non-whitelisted domains are forwarded as raw UDP to the upstream DNS server (auto-detected from system settings, fallback `114.114.114.114`). Responses are matched by DNS transaction ID and relayed back. 5s timeout for pending upstream queries.
 
@@ -78,4 +79,4 @@ curl -k https://perf.qzz.io:8443/
 
 **pm2 usage**: Start with `sudo pm2 start` — the process is already root, no elevation dialog needed.
 
-**dig/nslookup bypass**: These tools read network preferences directly. To test, point them explicitly: `dig @127.0.0.1 -p 53 <domain>`.
+**dig/nslookup bypass**: These tools read network preferences directly. To test, point them explicitly: `dig @127.0.0.2 -p 53 <domain>`.
