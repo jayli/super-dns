@@ -551,5 +551,10 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 // 提权（如需要）
 ensureRoot();
 
+// 确保 127.0.0.2 loopback 别名存在（macOS 默认不启用）
+try {
+  execSync('ifconfig lo0 alias 127.0.0.2 2>/dev/null; true', { timeout: 5000 });
+} catch (_) { /* ignore */ }
+
 // 启动
 server.bind(PORT, HOST);
