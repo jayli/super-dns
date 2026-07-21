@@ -53,10 +53,12 @@ function ensureRoot() {
     );
   } catch (e) {
     console.error('[!] 授权失败或已取消:', e.message);
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
+    try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
+    process.exit(1);
   }
 
+  // osascript 成功执行，子进程已接管，父进程正常退出
+  try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
   process.exit(0);
 }
 
@@ -64,25 +66,46 @@ function ensureRoot() {
 // 系统网络检测
 // ============================================================
 function getActiveInterface() {
-  if (process.env.NETWORK_INTERFACE) return process.env.NETWORK_INTERFACE;
+  // NETWORK_INTERFACE 环境变量：校验防止 shell 注入
+  if (process.env.NETWORK_INTERFACE) {
+    const iface = process.env.NETWORK_INTERFACE;
+    if (/^[a-zA-Z0-9 -]+$/.test(iface)) return iface;
+    console.error('[!] NETWORK_INTERFACE 包含非法字符，已忽略');
+  }
 
   try {
     const out = execSync('networksetup -listallnetworkservices', { encoding: 'utf-8', timeout: 5000 });
     const lines = out.split('\n').map(s => s.trim()).filter(Boolean);
-    // 过滤掉星号标记的已禁用接口
-    const active = lines.filter(l => !l.startsWith('*') && !l.startsWith('An asterisk'));
-    if (active.length > 0) return active[0];
+    // 过滤掉星号标记的已禁用接口（macOS 用 * 前缀标记禁用的服务，不依赖 locale）
+    const enabled = lines.filter(l => !l.startsWith('*'));
+
+    // 通过 -getinfo 检查哪个接口实际拥有 IP 地址
+    for (const svc of enabled) {
+      try {
+        const info = execSync(`networksetup -getinfo "${svc}"`, { encoding: 'utf-8', timeout: 5000 });
+        if (/^IP address:\s*\S/m.test(info)) return svc;
+      } catch (e) { /* skip this service */ }
+    }
+
+    if (enabled.length > 0) return enabled[0];
   } catch (e) { /* ignore */ }
 
   return 'Wi-Fi'; // fallback
 }
 
 function getUpstreamDNS(iface) {
+  // 校验 iface 参数防止 shell 注入
+  if (!/^[a-zA-Z0-9 -]+$/.test(iface)) {
+    console.error('[!] 网卡名称包含非法字符，使用默认上游 DNS');
+    return '114.114.114.114';
+  }
+
   if (process.env.UPSTREAM_DNS) return process.env.UPSTREAM_DNS;
 
   try {
     const out = execSync(`networksetup -getdnsservers "${iface}"`, { encoding: 'utf-8', timeout: 5000 });
-    const servers = out.split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('There'));
+    // 只保留有效的 IP 地址格式，不依赖 locale（避免 "There aren't any..." 等文本）
+    const servers = out.split('\n').map(s => s.trim()).filter(s => /^\d+\.\d+\.\d+\.\d+$/.test(s));
     if (servers.length > 0) return servers[0];
   } catch (e) { /* ignore */ }
 
