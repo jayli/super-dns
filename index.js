@@ -268,9 +268,9 @@ function resolveDohIp() {
       const { nextOffset } = readName(msg, 12);
       let off = nextOffset + 4; // 跳过 QTYPE+QCLASS
       const nameResult = readName(msg, off);
-      off = nameResult.nextOffset + 8; // TYPE+CLASS+TTL+RDLENGTH
-      const rdLen = msg.readUInt16BE(off - 2);
-      const rdata = msg.slice(off, off + rdLen);
+      off = nameResult.nextOffset + 8; // TYPE(2)+CLASS(2)+TTL(4)
+      const rdLen = msg.readUInt16BE(off); // RDLENGTH(2)
+      const rdata = msg.slice(off + 2, off + 2 + rdLen);
 
       if (rdata.length === 4) {
         dohIpCache = Array.from(rdata).join('.');
