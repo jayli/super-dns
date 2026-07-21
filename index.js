@@ -234,11 +234,68 @@ function forwardToUpstream(msg, rinfo) {
 // ============================================================
 // DoH 查询 (阿里云公共 DNS)
 // ============================================================
-function dohQuery(name, type) {
+const dohUrl = new URL(DOH_BASE);
+const dohHost = dohUrl.hostname;
+let dohIpCache = null;
+
+// 通过上游 DNS 解析 DoH 服务器 IP，避免循环依赖（系统 DNS 指向自身）
+function resolveDohIp() {
+  if (dohIpCache) return Promise.resolve(dohIpCache);
+
   return new Promise((resolve, reject) => {
+    const id = Math.floor(Math.random() * 65536);
+    const header = Buffer.alloc(12);
+    header.writeUInt16BE(id, 0);
+    header.writeUInt16BE(0x0100, 2);
+    header.writeUInt16BE(1, 4);
+
+    const question = Buffer.concat([
+      encodeName(dohHost),
+      Buffer.from([0x00, 0x01, 0x00, 0x01])
+    ]);
+    const query = Buffer.concat([header, question]);
+
+    const sock = dgram.createSocket('udp4');
+    const timer = setTimeout(() => { sock.close(); reject(new Error('DoH DNS 超时')); }, 3000);
+
+    sock.on('message', (msg) => {
+      clearTimeout(timer);
+      sock.close();
+      const respId = msg.readUInt16BE(0);
+      const anCount = msg.readUInt16BE(6);
+      if (respId !== id || anCount === 0) { reject(new Error('DoH DNS 无记录')); return; }
+
+      const { nextOffset } = readName(msg, 12);
+      let off = nextOffset + 4; // 跳过 QTYPE+QCLASS
+      const nameResult = readName(msg, off);
+      off = nameResult.nextOffset + 8; // TYPE+CLASS+TTL+RDLENGTH
+      const rdLen = msg.readUInt16BE(off - 2);
+      const rdata = msg.slice(off, off + rdLen);
+
+      if (rdata.length === 4) {
+        dohIpCache = Array.from(rdata).join('.');
+        resolve(dohIpCache);
+      } else {
+        reject(new Error('DoH DNS 非 IPv4'));
+      }
+    });
+
+    sock.send(query, 0, query.length, 53, UPSTREAM_DNS);
+  });
+}
+
+function dohQuery(name, type) {
+  return resolveDohIp().then(dohIp => new Promise((resolve, reject) => {
     const qtype = type === 28 ? 'AAAA' : 'A';
-    const url = `${DOH_BASE}?name=${encodeURIComponent(name)}&type=${qtype}`;
-    const req = https.get(url, { timeout: 3000 }, (res) => {
+    const req = https.request({
+      hostname: dohIp,
+      port: 443,
+      path: `${dohUrl.pathname}?name=${encodeURIComponent(name)}&type=${qtype}`,
+      method: 'GET',
+      servername: dohHost,
+      timeout: 3000,
+      headers: { Host: dohHost }
+    }, (res) => {
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
@@ -254,7 +311,8 @@ function dohQuery(name, type) {
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('DoH 超时')); });
-  });
+    req.end();
+  }));
 }
 
 // ============================================================
