@@ -4,12 +4,12 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { fork } = require('child_process');
+const { execSync } = require('child_process');
 
 // ============================================================
 // 配置
 // ============================================================
-const PORT = parseInt(process.env.PORT || '15353', 10);
+const PORT = parseInt(process.env.PORT || '53', 10);
 const HOST = process.env.HOST || '127.0.0.1';
 const DOH_BASE = process.env.DOH_BASE || 'https://dns.alidns.com/resolve';
 const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL || '300000', 10); // 5 min
@@ -17,10 +17,85 @@ const CONFIG_DIR = path.join(os.homedir(), '.config', 'super-dns');
 const DOMAINS_FILE = path.join(CONFIG_DIR, 'domains');
 
 // ============================================================
+// Root 提权
+// ============================================================
+function ensureRoot() {
+  try {
+    if (process.getuid() === 0) return;
+  } catch (e) {
+    return; // getuid not available
+  }
+
+  console.log('[*] 需要 root 权限监听 53 端口，正在请求授权...');
+
+  // 收集需要传递给 root 进程的环境变量
+  const passEnv = {};
+  for (const key of Object.keys(process.env)) {
+    if (/^(DOH_BASE|CACHE_TTL|UPSTREAM_DNS|NETWORK_INTERFACE|SUPER_DNS_VERBOSE|NODE_PATH|PATH|HOME)$/.test(key)) {
+      passEnv[key] = process.env[key];
+    }
+  }
+
+  const envLines = Object.entries(passEnv)
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+    .join('\n');
+
+  const shellScript = `#!/bin/bash\n${envLines}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)}`;
+
+  const tmpFile = `/tmp/super-dns-elevate-${process.pid}.sh`;
+  fs.writeFileSync(tmpFile, shellScript, { mode: 0o700 });
+
+  try {
+    execSync(
+      `osascript -e 'do shell script "bash ${tmpFile}" with administrator privileges'`,
+      { stdio: 'inherit' }
+    );
+  } catch (e) {
+    console.error('[!] 授权失败或已取消:', e.message);
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
+  }
+
+  process.exit(0);
+}
+
+// ============================================================
+// 系统网络检测
+// ============================================================
+function getActiveInterface() {
+  if (process.env.NETWORK_INTERFACE) return process.env.NETWORK_INTERFACE;
+
+  try {
+    const out = execSync('networksetup -listallnetworkservices', { encoding: 'utf-8', timeout: 5000 });
+    const lines = out.split('\n').map(s => s.trim()).filter(Boolean);
+    // 过滤掉星号标记的已禁用接口
+    const active = lines.filter(l => !l.startsWith('*') && !l.startsWith('An asterisk'));
+    if (active.length > 0) return active[0];
+  } catch (e) { /* ignore */ }
+
+  return 'Wi-Fi'; // fallback
+}
+
+function getUpstreamDNS(iface) {
+  if (process.env.UPSTREAM_DNS) return process.env.UPSTREAM_DNS;
+
+  try {
+    const out = execSync(`networksetup -getdnsservers "${iface}"`, { encoding: 'utf-8', timeout: 5000 });
+    const servers = out.split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('There'));
+    if (servers.length > 0) return servers[0];
+  } catch (e) { /* ignore */ }
+
+  return '114.114.114.114'; // fallback
+}
+
+const NETWORK_INTERFACE = getActiveInterface();
+const UPSTREAM_DNS = getUpstreamDNS(NETWORK_INTERFACE);
+
+// ============================================================
 // 域名列表加载
 // ============================================================
 function loadDomains(file) {
-  // 自动创建配置文件
   if (!fs.existsSync(file)) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, '# Super DNS 域名配置\n# 每行一个域名，支持通配符\n# 例: *.qzz.io 表示接管 qzz.io 及其所有子域名\n# 例: aaa.qzz.io 表示只接管这一个域名\n\n*.qzz.io\n', 'utf-8');
@@ -39,10 +114,8 @@ function loadDomains(file) {
     process.exit(1);
   }
 
-  // 解析域名规则
   const rules = lines.map(line => {
     if (line.startsWith('*.')) {
-      // 通配符: *.qzz.io → 匹配 qzz.io 及所有子域
       const base = line.slice(2);
       return { type: 'wildcard', base, raw: line };
     }
@@ -54,33 +127,8 @@ function loadDomains(file) {
   return rules;
 }
 
+// 在尝试 root 提权之前先加载配置（验证配置有效性）
 const domainRules = loadDomains(DOMAINS_FILE);
-
-// 从规则中提取需要配置 resolver 的域名
-function getResolverDomains() {
-  const domains = new Set();
-  for (const rule of domainRules) {
-    if (rule.type === 'wildcard') {
-      domains.add(rule.base); // *.qzz.io → resolver 文件用 qzz.io
-    } else {
-      // 精确域名，提取二级域作为 resolver 文件名
-      // 比如 aaa.qzz.io → resolver 文件用 qzz.io
-      const parts = rule.domain.split('.');
-      if (parts.length >= 2) {
-        domains.add(parts.slice(-2).join('.'));
-      } else {
-        domains.add(rule.domain);
-      }
-    }
-  }
-  return [...domains];
-}
-
-// ============================================================
-// macOS Resolver 自动配置
-// ============================================================
-const RESOLVER_DIR = '/etc/resolver';
-let resolverConfigured = false;
 
 // ============================================================
 // 缓存
@@ -370,8 +418,6 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-const resolverDomains = getResolverDomains();
-
 server.on('listening', () => {
   const addr = server.address();
   console.log('');
@@ -382,92 +428,9 @@ server.on('listening', () => {
   console.log(`[*] DoH:  ${DOH_BASE}`);
   console.log(`[*] 缓存: ${CACHE_TTL_MS / 1000}s`);
   console.log(`[*] 配置: ${DOMAINS_FILE}`);
+  console.log(`[*] 网卡: ${NETWORK_INTERFACE}`);
+  console.log(`[*] 上游: ${UPSTREAM_DNS}`);
   console.log('');
-  console.log('[*] 正在配置 macOS 独立解析器（可能需要输入密码）...');
-
-  // 用子进程配置 macOS resolver，避免阻塞 DNS 服务
-  // osascript 弹密码框期间 DNS 仍可正常响应
-  // 关键：chown 把 resolver 文件归属当前用户，退出时 rm 不需要 sudo
-  const currentUser = os.userInfo().username;
-  const setupScript = `
-    const fs = require('fs');
-    const { execSync } = require('child_process');
-    const resolverDomains = ${JSON.stringify(resolverDomains)};
-    const host = '${addr.address}';
-    const port = ${addr.port};
-    const RESOLVER_DIR = '${RESOLVER_DIR}';
-    const pid = ${process.pid};
-    const currentUser = '${currentUser}';
-
-    function sudoExec(cmd) {
-      const escaped = cmd.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
-      execSync(
-        \`osascript -e 'do shell script "\${escaped}" with administrator privileges'\`,
-        { stdio: 'pipe', timeout: 120000 }
-      );
-    }
-
-    try {
-      const commands = ['mkdir -p ' + RESOLVER_DIR];
-      for (const domain of resolverDomains) {
-        const tmpFile = '/tmp/super-dns-' + domain + '-' + pid;
-        const resolverFile = RESOLVER_DIR + '/' + domain;
-        fs.writeFileSync(tmpFile, '# Auto-generated by super-dns (PID ' + pid + ')\\nnameserver ' + host + '\\nport ' + port + '\\n');
-        commands.push('mv ' + tmpFile + ' ' + resolverFile);
-        commands.push('chmod 644 ' + resolverFile);
-        commands.push('chown ' + currentUser + ' ' + resolverFile);
-      }
-      sudoExec(commands.join(' && '));
-
-      // 验证 chown 是否生效，确保退出时 unlinkSync 能直接删除
-      for (const domain of resolverDomains) {
-        const resolverFile = RESOLVER_DIR + '/' + domain;
-        try {
-          const stat = fs.statSync(resolverFile);
-          const owner = require('os').userInfo().uid;
-          if (stat.uid !== owner) {
-            process.send({ type: 'setup-warn', domain, error: 'chown 未生效 (uid=' + stat.uid + ', 期望=' + owner + ')，退出时可能需要手动清理' });
-          }
-        } catch (statErr) {
-          // 忽略 stat 错误
-        }
-        process.send({ type: 'setup-ok', domain });
-      }
-      process.send({ type: 'setup-done' });
-    } catch (e) {
-      process.send({ type: 'setup-fail', error: e.message });
-    }
-  `;
-
-  const setupChild = fork(`-e`, [setupScript], {
-    silent: true,
-    detached: false
-  });
-
-  setupChild.on('message', (msg) => {
-    if (msg.type === 'setup-ok') {
-      console.log(`    ✓ ${RESOLVER_DIR}/${msg.domain} → ${addr.address}:${addr.port}`);
-    } else if (msg.type === 'setup-warn') {
-      console.warn(`    ⚠ ${RESOLVER_DIR}/${msg.domain}: ${msg.error}`);
-    } else if (msg.type === 'setup-done') {
-      resolverConfigured = true;
-      console.log('[*] macOS 解析器配置完成');
-      console.log('');
-    } else if (msg.type === 'setup-fail') {
-      console.error(`[!] 配置 macOS 解析器失败: ${msg.error}`);
-      console.error('[!] 请手动执行:');
-      for (const domain of resolverDomains) {
-        console.error(`    sudo mkdir -p ${RESOLVER_DIR}`);
-        console.error(`    echo "nameserver ${addr.address}\\nport ${addr.port}" | sudo tee ${RESOLVER_DIR}/${domain}`);
-      }
-    }
-  });
-
-  setupChild.on('exit', (code) => {
-    if (code !== 0 && code !== null) {
-      console.error(`[!] resolver 配置子进程异常退出 (code=${code})`);
-    }
-  });
 });
 
 // ============================================================
@@ -486,29 +449,15 @@ function shutdown(signal) {
     console.log('[*] DNS 服务已关闭');
   });
 
-  if (resolverConfigured) {
-    console.log('[*] 正在清理 macOS 独立解析器...');
-    for (const domain of resolverDomains) {
-      const resolverFile = `${RESOLVER_DIR}/${domain}`;
-      try {
-        // 文件已 chown 为当前用户，直接 rm 即可，无需 sudo
-        fs.unlinkSync(resolverFile);
-        console.log(`    ✓ 已删除 ${resolverFile}`);
-      } catch (e) {
-        // pm2 等进程管理器 kill_timeout 很短，osascript 弹密码框来不及输入就会被 SIGKILL
-        // 不弹框，改为提示手动清理
-        console.error(`    ✗ 删除 ${resolverFile} 失败: ${e.message}`);
-        console.error(`    请手动执行: sudo rm ${resolverFile}`);
-      }
-    }
-  }
-
   console.log('[*] 已关闭');
   process.exit(0);
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// 提权（如需要）
+ensureRoot();
 
 // 启动
 server.bind(PORT, HOST);
