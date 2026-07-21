@@ -4,7 +4,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { execSync, spawn } = require('child_process');
 
 // ============================================================
 // 配置
@@ -47,19 +47,23 @@ function ensureRoot() {
   fs.writeFileSync(tmpFile, shellScript, { mode: 0o700 });
 
   try {
-    execSync(
-      `osascript -e 'do shell script "bash ${tmpFile}" with administrator privileges'`,
-      { stdio: 'inherit' }
-    );
+    // 用 spawn detached 避免阻塞：父进程立即退出，osascript 启动的 root 子进程接管
+    const child = spawn('osascript', [
+      '-e', `do shell script "bash ${tmpFile}" with administrator privileges`
+    ], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    child.unref();
   } catch (e) {
     console.error('[!] 授权失败或已取消:', e.message);
     try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
     process.exit(1);
   }
 
-  // osascript 成功执行，子进程已接管，父进程正常退出
-  try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
-  process.exit(0);
+  // 父进程退出，root 子进程已通过 osascript 启动
+  // tmpFile 由子进程读取后由系统清理 /tmp
+  setTimeout(() => process.exit(0), 200);
 }
 
 // ============================================================
@@ -175,6 +179,38 @@ function cacheGet(name, type) {
 
 function cacheSet(name, type, data) {
   cache.set(cacheKey(name, type), { data, ts: Date.now() });
+}
+
+// ============================================================
+// 上游 DNS UDP 透传
+// ============================================================
+const upstreamSocket = dgram.createSocket('udp4');
+const pendingUpstream = new Map(); // key → { rinfo, dnsId, timer }
+
+upstreamSocket.on('message', (msg) => {
+  if (msg.length < 2) return;
+  const dnsId = msg.readUInt16BE(0);
+
+  for (const [key, entry] of pendingUpstream) {
+    if (entry.dnsId === dnsId) {
+      clearTimeout(entry.timer);
+      server.send(msg, entry.rinfo.port, entry.rinfo.address);
+      pendingUpstream.delete(key);
+      return;
+    }
+  }
+});
+
+function forwardToUpstream(msg, rinfo) {
+  const dnsId = msg.readUInt16BE(0);
+  const key = `${rinfo.address}:${rinfo.port}:${dnsId}:${Date.now()}`;
+
+  const timer = setTimeout(() => {
+    pendingUpstream.delete(key);
+  }, 5000);
+
+  pendingUpstream.set(key, { rinfo, dnsId, timer });
+  upstreamSocket.send(msg, 0, msg.length, 53, UPSTREAM_DNS);
 }
 
 // ============================================================
@@ -394,13 +430,14 @@ server.on('message', async (msg, rinfo) => {
 
   const cleanName = req.name.endsWith('.') ? req.name.slice(0, -1) : req.name;
   const typeStr = req.qtype === 1 ? 'A' : req.qtype === 28 ? 'AAAA' : `TYPE${req.qtype}`;
-  console.log(`[>] ${cleanName} ${typeStr} from ${rinfo.address}:${rinfo.port}`);
 
   if (!isManaged(req.name)) {
-    console.log(`[x] 不在管理列表中，返回 NXDOMAIN`);
-    server.send(buildNxDomain(req), rinfo.port, rinfo.address);
+    // 非管理域名：UDP 原样透传到上游 DNS
+    forwardToUpstream(msg, rinfo);
     return;
   }
+
+  console.log(`[>] ${cleanName} ${typeStr} from ${rinfo.address}:${rinfo.port}`);
 
   if (req.qtype !== 1 && req.qtype !== 28) {
     console.log(`[x] 不支持的查询类型 ${typeStr}，返回空回答`);
@@ -445,14 +482,13 @@ server.on('listening', () => {
   const addr = server.address();
   console.log('');
   console.log('╔══════════════════════════════════════════════╗');
-  console.log('║           Super DNS 本地代理服务             ║');
+  console.log('║           Super DNS 本地代理服务 v2          ║');
   console.log('╚══════════════════════════════════════════════╝');
   console.log(`[*] 监听: ${addr.address}:${addr.port} (UDP)`);
   console.log(`[*] DoH:  ${DOH_BASE}`);
   console.log(`[*] 缓存: ${CACHE_TTL_MS / 1000}s`);
+  console.log(`[*] 上游 DNS: ${UPSTREAM_DNS}`);
   console.log(`[*] 配置: ${DOMAINS_FILE}`);
-  console.log(`[*] 网卡: ${NETWORK_INTERFACE}`);
-  console.log(`[*] 上游: ${UPSTREAM_DNS}`);
   console.log('');
 });
 
