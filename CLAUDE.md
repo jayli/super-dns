@@ -4,53 +4,60 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Super DNS is a system-wide DNS proxy for macOS that prevents DNS hijacking. It listens on port 53 and intercepts all DNS queries from the system. Whitelisted domains (configured in `~/.config/super-dns/domains`) are resolved via Alibaba Cloud's DoH (DNS over HTTPS); all other domains are forwarded raw to the upstream DNS server unchanged.
+Super DNS is a system-wide DNS proxy for macOS that prevents DNS hijacking. It listens directly on `127.0.0.1:53`. Whitelisted domains (configured in `~/.config/super-dns/domains`) are resolved via Alibaba Cloud's DoH (DNS over HTTPS); all other domains are forwarded raw to the upstream DNS server unchanged.
 
 ## Commands
 
 ```bash
-# Start the DNS server (requires root for port 53)
-sudo node index.js
-# or
+# Start the DNS server (uses osascript to launch a root child for port 53)
 npm start
+# or interactive menu
+super-dns
+
+# Direct commands
+super-dns start
+super-dns end
 
 # Test DNS resolution
-dig @127.0.0.2 -p 53 perf.qzz.io A +short
-dig @127.0.0.2 -p 53 baidu.com A +short
+dig @127.0.0.1 perf.qzz.io A +short
+dig @127.0.0.1 baidu.com A +short
 
 # Verify system DNS is pointed to local proxy
-scutil --dns | head -20
 networksetup -getdnsservers Wi-Fi
 
-# Test with system resolver (works for ping, curl, browsers once DNS is set)
+# Test with system resolver (ping, curl, browsers)
 ping perf.qzz.io
 curl -k https://perf.qzz.io:8443/
 
-# Graceful shutdown (auto-restores DNS)
-# Press Ctrl+C or: kill -TERM <PID>
+# Graceful shutdown
+super-dns end
 ```
 
 ## Architecture
 
-**Single-file design**: Everything is in `index.js` (~530 lines), organized into logical sections:
-- Configuration and domain loading (lines 1-30)
-- Root elevation via osascript (lines 30-90)
-- System network detection and upstream DNS reading (lines 90-130)
-- DNS caching with TTL (lines 130-180)
-- Upstream DNS UDP forwarding (lines 180-220)
-- DoH querying to Alibaba Cloud (lines 220-280)
-- Hand-rolled DNS packet parsing/building (lines 280-440)
-- UDP server and request handling (lines 440-510)
-- Graceful shutdown with DNS restore (lines 510-540)
+**Single-file design**: Everything is in `index.js` (~510 lines), organized into logical sections:
+- Configuration (lines 1-18)
+- Privileged operations via osascript: `sudoExec()` (lines 20-29)
+- System network detection and upstream DNS reading (lines 30-85)
+- Domain loading (lines 85-122)
+- DNS caching with TTL (lines 124-146)
+- Upstream DNS UDP forwarding (lines 148-178)
+- DoH querying to Alibaba Cloud (lines 180-205)
+- Hand-rolled DNS packet parsing/building (lines 207-358)
+- Domain matching (lines 360-373)
+- UDP server and request handling (lines 375-471)
+- Graceful shutdown with pf/DNS cleanup (lines 473-513)
 
 **Key design decisions**:
 - Zero dependencies - pure Node.js implementation
-- Uses `osascript` for privilege elevation (macOS GUI password prompt instead of terminal)
-- Lock file (`/tmp/super-dns-elevate.lock`) prevents repeated elevation dialogs
-- Shell script uses `nohup &` so osascript returns and parent exits cleanly
+- Root child binds directly to `127.0.0.1:53`
+- Uses `osascript` for one-time privilege elevation (macOS GUI password dialog)
+- `networksetup -setdnsservers` replaces `/etc/resolver` — entire system DNS points to 127.0.0.1
 - Hand-rolled DNS protocol implementation (no external DNS library)
-- Binds to `127.0.0.2:53` to avoid conflicting with macOS `mDNSResponder` on `127.0.0.1:53`
-- `networksetup -setdnsservers` replaces `/etc/resolver` — entire system DNS points to 127.0.0.2
+- Upstream loopback guard: skips upstream DNS servers starting with `127.` to prevent forwarding loops
+- Node v26 compat: uses `Buffer.from(buf.subarray(...))` instead of deprecated `buf.slice()`
+
+**Transparent proxy for DoH**: `https.get` internally calls `dns.lookup` → system DNS → proxy → forwarded to upstream → response → HTTPS connection established. No special DoH DNS resolution needed.
 
 **Configuration file**: `~/.config/super-dns/domains`
 - One domain per line, supports `#` comments
@@ -67,16 +74,21 @@ curl -k https://perf.qzz.io:8443/
 
 ## Important Notes
 
-**Port 53 requires root**: On first launch a macOS GUI password dialog appears. The elevated process runs `nohup` in background and logs to `/tmp/super-dns.log`.
+**System DNS via networksetup**: On startup, `networksetup -setdnsservers <iface> 127.0.0.1` redirects all system DNS to the proxy.
 
-**System DNS via networksetup**: On startup, `networksetup -setdnsservers <iface> 127.0.0.2` redirects all system DNS to the proxy (using `127.0.0.2` to avoid mDNSResponder's `127.0.0.1` binding).
-
-**Upstream DNS forwarding**: Non-whitelisted domains are forwarded as raw UDP to the upstream DNS server (auto-detected from system settings, fallback `114.114.114.114`). Responses are matched by DNS transaction ID and relayed back. 5s timeout for pending upstream queries.
+**Upstream DNS forwarding**: Non-whitelisted domains are forwarded as raw UDP to the upstream DNS server (auto-detected from system settings, fallback `114.114.114.114`). Loopback addresses (`127.x.x.x`) are skipped to prevent forwarding dead loops. Responses are matched by DNS transaction ID and relayed back. 5s timeout for pending upstream queries.
 
 **Whitelist-only caching**: Only whitelisted domain DoH responses are cached. Upstream-forwarded responses are not cached.
 
-**Lock file**: `/tmp/super-dns-elevate.lock` prevents concurrent elevation attempts. Stale after 30s. Root process cleans it on startup.
+**Startup auth dialog**: `super-dns start` shows one macOS GUI password dialog to launch the root child process. The root child listens on `127.0.0.1:53` and configures system DNS.
 
-**pm2 usage**: Start with `sudo pm2 start` — the process is already root, no elevation dialog needed.
+**CLI control**: `super-dns start` starts the background service, `super-dns end` stops it and restores DNS. `super-dns` or `npm start` opens a two-item menu whose first item is the safe default action for the current service state.
 
-**dig/nslookup bypass**: These tools read network preferences directly. To test, point them explicitly: `dig @127.0.0.2 -p 53 <domain>`.
+**Service log**: The root child writes `/tmp/super-dns.log` through the internal bounded logger. The log file keeps at most 500 lines.
+
+**dig/nslookup bypass**: These tools read network preferences directly. To test through the proxy, use `dig @127.0.0.1 <domain>`.
+
+**Manual cleanup** (if process exits abnormally):
+```bash
+sudo networksetup -setdnsservers Wi-Fi Empty
+```

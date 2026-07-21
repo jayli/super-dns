@@ -4,48 +4,59 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const util = require('util');
 const { execSync } = require('child_process');
 
 // ============================================================
 // 配置
 // ============================================================
 const PORT = parseInt(process.env.PORT || '53', 10);
-const HOST = process.env.HOST || '127.0.0.2';
+const HOST = process.env.HOST || '127.0.0.1';
 const DOH_BASE = process.env.DOH_BASE || 'https://dns.alidns.com/resolve';
-const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL || '300000', 10); // 5 min
+const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL || '300000', 10);
+const VERBOSE = process.env.SUPER_DNS_VERBOSE === '1';
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'super-dns');
 const DOMAINS_FILE = path.join(CONFIG_DIR, 'domains');
+const ELEVATE_LOCK = '/tmp/super-dns-elevate.lock';
+const PID_FILE = '/tmp/super-dns.pid';
+const LOG_FILE = '/tmp/super-dns.log';
+const LOG_MAX_LINES = 500;
+let NETWORK_INTERFACE = null;
+let UPSTREAM_DNS = null;
+let domainRules = [];
 
 // ============================================================
 // Root 提权
 // ============================================================
-const ELEVATE_LOCK = '/tmp/super-dns-elevate.lock';
-
-function ensureRoot() {
-  // 已经是 root，清理可能残留的锁文件后直接返回
+function isRoot() {
   try {
-    if (process.getuid() === 0) {
-      try { fs.unlinkSync(ELEVATE_LOCK); } catch (_) { /* ignore */ }
-      return;
-    }
-  } catch (e) {
-    return; // getuid not available
+    return process.getuid && process.getuid() === 0;
+  } catch {
+    return false;
   }
+}
 
-  // 锁文件检查：防止 pm2 反复重启导致多次弹框
+function sudoExec(cmd) {
+  const escaped = cmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return execSync(
+    `osascript -e 'do shell script "${escaped}" with administrator privileges'`,
+    { stdio: 'inherit', timeout: 120000 }
+  );
+}
+
+function launchServiceAsRoot() {
   if (fs.existsSync(ELEVATE_LOCK)) {
     const lockAge = Date.now() - fs.statSync(ELEVATE_LOCK).mtimeMs;
     if (lockAge < 30000) {
       console.log('[*] 已有提权进程在处理中，退出等待');
       process.exit(0);
     }
-    try { fs.unlinkSync(ELEVATE_LOCK); } catch (_) { /* stale lock */ }
+    try { fs.unlinkSync(ELEVATE_LOCK); } catch (_) { /* ignore */ }
   }
+
   fs.writeFileSync(ELEVATE_LOCK, String(process.pid));
+  console.log('[*] 需要管理员权限监听 53 端口，正在请求授权...');
 
-  console.log('[*] 需要 root 权限监听 53 端口，正在请求授权...');
-
-  // 收集需要传递给 root 进程的环境变量
   const passEnv = {};
   for (const key of Object.keys(process.env)) {
     if (/^(DOH_BASE|CACHE_TTL|UPSTREAM_DNS|NETWORK_INTERFACE|SUPER_DNS_VERBOSE|NODE_PATH|PATH|HOME)$/.test(key)) {
@@ -53,42 +64,256 @@ function ensureRoot() {
     }
   }
 
+  passEnv.PORT = String(PORT);
+  passEnv.HOST = HOST;
+  passEnv.SUPER_DNS_SERVICE = '1';
+
   const envLines = Object.entries(passEnv)
     .filter(([, v]) => v != null)
     .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
     .join('\n');
 
-  // 用 nohup & 后台化而非 exec，让 osascript 能正常返回
-  // 这样 execSync 不会永久阻塞，pm2 也不会反复重启弹框
-  const shellScript = `#!/bin/bash\n${envLines}\nnohup ${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)} > /tmp/super-dns.log 2>&1 &\nrm -f ${ELEVATE_LOCK}`;
+  const script = [
+    '#!/bin/bash',
+    envLines,
+    `${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)} > /dev/null 2>&1 < /dev/null &`,
+    `rm -f ${JSON.stringify(ELEVATE_LOCK)}`
+  ].join('\n');
 
   const tmpFile = `/tmp/super-dns-elevate-${process.pid}.sh`;
-  fs.writeFileSync(tmpFile, shellScript, { mode: 0o700 });
+  fs.writeFileSync(tmpFile, script, { mode: 0o700 });
 
   try {
+    const escaped = `bash ${tmpFile}`.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     execSync(
-      `osascript -e 'do shell script "bash ${tmpFile}" with administrator privileges'`,
-      { stdio: 'inherit' }
+      `osascript -e 'do shell script "${escaped}" with administrator privileges'`,
+      { stdio: 'inherit', timeout: 120000 }
     );
+    console.log(`[*] 已请求启动 Root DNS 服务，日志: ${LOG_FILE}`);
   } catch (e) {
-    console.error('[!] 授权失败或已取消:', e.message);
-    try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
+    console.error(`[!] 授权失败或已取消: ${e.message}`);
     try { fs.unlinkSync(ELEVATE_LOCK); } catch (_) { /* ignore */ }
     process.exit(1);
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
   }
 
-  try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
+  if (!waitForServiceStart()) {
+    console.error(`[!] Root DNS 服务未能在 5 秒内启动，请查看日志: ${LOG_FILE}`);
+    process.exit(1);
+  }
+  console.log(`[*] Root DNS 服务已启动，PID: ${getServicePid()}`);
+}
 
-  // osascript 执行完毕，root 子进程已在后台运行
-  console.log('[*] Root 子进程已启动 (日志: /tmp/super-dns.log)');
-  process.exit(0);
+function readPid() {
+  try {
+    const raw = fs.readFileSync(PID_FILE, 'utf-8').trim();
+    const pid = parseInt(raw, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPidRunning(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+function findServiceProcessPid() {
+  try {
+    const out = execSync('ps ax -o pid= -o command=', { encoding: 'utf-8', timeout: 5000 });
+    for (const line of out.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const match = trimmed.match(/^(\d+)\s+(.+)$/);
+      if (!match) continue;
+      const pid = parseInt(match[1], 10);
+      const command = match[2];
+      if (pid === process.pid) continue;
+      if (command.includes('node') && command.includes(__filename)) return pid;
+    }
+  } catch (_) {
+    return null;
+  }
+  return null;
+}
+
+function getServicePid() {
+  const pid = readPid();
+  if (isPidRunning(pid)) return pid;
+  try { fs.unlinkSync(PID_FILE); } catch (_) { /* ignore */ }
+  return findServiceProcessPid();
+}
+
+function isServiceRunning() {
+  return Boolean(getServicePid());
+}
+
+function waitForServiceStart() {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (isServiceRunning()) return true;
+    try { execSync('sleep 0.2'); } catch (_) { /* ignore */ }
+  }
+  return false;
+}
+
+function startService() {
+  const pid = getServicePid();
+  if (pid) {
+    console.log(`[*] Super DNS 已在运行，PID: ${pid}`);
+    console.log(`[*] 日志: ${LOG_FILE}`);
+    return;
+  }
+
+  if (isRoot()) {
+    process.env.SUPER_DNS_SERVICE = '1';
+    runService();
+    return;
+  }
+
+  launchServiceAsRoot();
+}
+
+function stopService() {
+  const pid = getServicePid();
+  const iface = getActiveInterface();
+
+  if (!pid) {
+    console.log('[*] Super DNS 未运行');
+    try {
+      execSync(`networksetup -setdnsservers "${iface}" Empty`, { timeout: 10000 });
+      console.log(`[*] 已恢复 ${iface} DNS 为默认`);
+    } catch (e) {
+      console.error(`[!] 恢复系统 DNS 失败: ${e.message}`);
+    }
+    return;
+  }
+
+  console.log(`[*] 正在关闭 Super DNS，PID: ${pid}`);
+  try {
+    sudoExec(
+      `kill -TERM ${pid} 2>/dev/null || true; ` +
+      `networksetup -setdnsservers "${iface}" Empty; ` +
+      `rm -f ${PID_FILE}`
+    );
+    console.log('[*] Super DNS 已关闭');
+  } catch (e) {
+    console.error(`[!] 关闭失败: ${e.message}`);
+    console.error(`    请手动执行: sudo kill -TERM ${pid}`);
+    console.error(`    请手动执行: sudo networksetup -setdnsservers "${iface}" Empty`);
+    process.exit(1);
+  }
+}
+
+function renderMenu(title, items, selected) {
+  process.stdout.write('\x1b[2J\x1b[H');
+  console.log(title);
+  console.log('');
+  items.forEach((item, idx) => {
+    console.log(`${idx === selected ? '>' : ' '} ${item}`);
+  });
+  console.log('');
+  console.log('使用 ↑/↓ 选择，Enter 确认，q 退出');
+}
+
+function showMenu() {
+  const running = isServiceRunning();
+  const title = running ? 'Super DNS 服务正在运行' : 'Super DNS 服务未运行';
+  const items = running ? ['关闭服务', '退出'] : ['启动服务', '退出'];
+  let selected = 0;
+
+  if (!process.stdin.isTTY) {
+    console.log(title);
+    console.log(`1. ${items[0]}`);
+    console.log(`2. ${items[1]}`);
+    return;
+  }
+
+  const wasRaw = process.stdin.isRaw;
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
+  renderMenu(title, items, selected);
+
+  process.stdin.on('data', (key) => {
+    if (key === '\u0003' || key === 'q') {
+      process.stdin.setRawMode(Boolean(wasRaw));
+      process.stdout.write('\n');
+      process.exit(0);
+    }
+
+    if (key === '\u001b[A' || key === '\u001b[B') {
+      selected = selected === 0 ? 1 : 0;
+      renderMenu(title, items, selected);
+      return;
+    }
+
+    if (key === '\r' || key === '\n') {
+      process.stdin.setRawMode(Boolean(wasRaw));
+      process.stdout.write('\n');
+      if (selected === 1) process.exit(0);
+      if (running) stopService();
+      else startService();
+    }
+  });
+}
+
+function runCli() {
+  const command = (process.argv[2] || '').toLowerCase();
+  switch (command) {
+    case 'start':
+      startService();
+      break;
+    case 'end':
+      stopService();
+      break;
+    case '':
+      showMenu();
+      break;
+    default:
+      console.error(`未知命令: ${command}`);
+      console.error('用法: super-dns [start|end]');
+      process.exit(1);
+  }
+}
+
+function writeBoundedLog(line) {
+  let lines = [];
+  try {
+    lines = fs.readFileSync(LOG_FILE, 'utf-8').split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  } catch (_) {
+    lines = [];
+  }
+
+  lines.push(line);
+  fs.writeFileSync(LOG_FILE, `${lines.slice(-LOG_MAX_LINES).join('\n')}\n`);
+}
+
+function installServiceLogger() {
+  const write = (level, args) => {
+    const text = util.format(...args);
+    const stamp = new Date().toISOString();
+    for (const line of text.split('\n')) {
+      writeBoundedLog(`${stamp} ${level} ${line}`);
+    }
+  };
+
+  console.log = (...args) => write('INFO', args);
+  console.error = (...args) => write('ERROR', args);
 }
 
 // ============================================================
 // 系统网络检测
 // ============================================================
 function getActiveInterface() {
-  // NETWORK_INTERFACE 环境变量：校验防止 shell 注入
   if (process.env.NETWORK_INTERFACE) {
     const iface = process.env.NETWORK_INTERFACE;
     if (/^[a-zA-Z0-9 -]+$/.test(iface)) return iface;
@@ -98,44 +323,42 @@ function getActiveInterface() {
   try {
     const out = execSync('networksetup -listallnetworkservices', { encoding: 'utf-8', timeout: 5000 });
     const lines = out.split('\n').map(s => s.trim()).filter(Boolean);
-    // 过滤掉星号标记的已禁用接口（macOS 用 * 前缀标记禁用的服务，不依赖 locale）
     const enabled = lines.filter(l => !l.startsWith('*'));
 
-    // 通过 -getinfo 检查哪个接口实际拥有 IP 地址
     for (const svc of enabled) {
       try {
         const info = execSync(`networksetup -getinfo "${svc}"`, { encoding: 'utf-8', timeout: 5000 });
         if (/^IP address:\s*\S/m.test(info)) return svc;
-      } catch (e) { /* skip this service */ }
+      } catch (e) { /* skip */ }
     }
 
     if (enabled.length > 0) return enabled[0];
   } catch (e) { /* ignore */ }
 
-  return 'Wi-Fi'; // fallback
+  return 'Wi-Fi';
 }
 
 function getUpstreamDNS(iface) {
-  // 校验 iface 参数防止 shell 注入
   if (!/^[a-zA-Z0-9 -]+$/.test(iface)) {
     console.error('[!] 网卡名称包含非法字符，使用默认上游 DNS');
     return '114.114.114.114';
   }
 
-  if (process.env.UPSTREAM_DNS) return process.env.UPSTREAM_DNS;
+  if (process.env.UPSTREAM_DNS && !process.env.UPSTREAM_DNS.startsWith('127.')) {
+    return process.env.UPSTREAM_DNS;
+  }
 
   try {
     const out = execSync(`networksetup -getdnsservers "${iface}"`, { encoding: 'utf-8', timeout: 5000 });
-    // 只保留有效的 IP 地址格式，不依赖 locale（避免 "There aren't any..." 等文本）
     const servers = out.split('\n').map(s => s.trim()).filter(s => /^\d+\.\d+\.\d+\.\d+$/.test(s));
-    if (servers.length > 0) return servers[0];
+    for (const s of servers) {
+      // 跳过环回地址，避免转发死循环
+      if (!s.startsWith('127.')) return s;
+    }
   } catch (e) { /* ignore */ }
 
-  return '114.114.114.114'; // fallback
+  return '114.114.114.114';
 }
-
-const NETWORK_INTERFACE = getActiveInterface();
-const UPSTREAM_DNS = getUpstreamDNS(NETWORK_INTERFACE);
 
 // ============================================================
 // 域名列表加载
@@ -172,9 +395,6 @@ function loadDomains(file) {
   return rules;
 }
 
-// 在尝试 root 提权之前先加载配置（验证配置有效性）
-const domainRules = loadDomains(DOMAINS_FILE);
-
 // ============================================================
 // 缓存
 // ============================================================
@@ -203,31 +423,59 @@ function cacheSet(name, type, data) {
 // 上游 DNS UDP 透传
 // ============================================================
 const upstreamSocket = dgram.createSocket('udp4');
-const pendingUpstream = new Map(); // key → { rinfo, dnsId, timer }
+const pendingUpstream = new Map(); // upstreamId -> { rinfo, clientDnsId, timer }
+let nextUpstreamId = 1;
+
+function sendToClient(msg, rinfo, label) {
+  server.send(msg, rinfo.port, rinfo.address, (err) => {
+    if (err) {
+      console.error(`[!] 响应发送失败 ${label}: ${err.message}`);
+    } else if (VERBOSE) {
+      const tailIp = msg.length >= 4 ? Array.from(msg.subarray(msg.length - 4)).join('.') : '-';
+      console.log(`[<] 已发送 ${label}: ${msg.length} bytes to ${rinfo.address}:${rinfo.port} tail=${tailIp}`);
+    }
+  });
+}
 
 upstreamSocket.on('message', (msg) => {
   if (msg.length < 2) return;
-  const dnsId = msg.readUInt16BE(0);
+  const upstreamId = msg.readUInt16BE(0);
+  const entry = pendingUpstream.get(upstreamId);
+  if (!entry) return;
 
-  for (const [key, entry] of pendingUpstream) {
-    if (entry.dnsId === dnsId) {
-      clearTimeout(entry.timer);
-      server.send(msg, entry.rinfo.port, entry.rinfo.address);
-      pendingUpstream.delete(key);
-      return;
-    }
-  }
+  clearTimeout(entry.timer);
+  pendingUpstream.delete(upstreamId);
+
+  const response = Buffer.from(msg);
+  response.writeUInt16BE(entry.clientDnsId, 0);
+  sendToClient(response, entry.rinfo, 'upstream');
 });
 
+function allocateUpstreamId() {
+  for (let i = 0; i < 65535; i++) {
+    const upstreamId = nextUpstreamId;
+    nextUpstreamId = nextUpstreamId >= 65535 ? 1 : nextUpstreamId + 1;
+    if (!pendingUpstream.has(upstreamId)) return upstreamId;
+  }
+  return null;
+}
+
 function forwardToUpstream(msg, rinfo) {
-  const dnsId = msg.readUInt16BE(0);
-  const key = `${rinfo.address}:${rinfo.port}:${dnsId}:${Date.now()}`;
+  const clientDnsId = msg.readUInt16BE(0);
+  const upstreamId = allocateUpstreamId();
+  if (!upstreamId) {
+    console.error('[!] 上游 DNS 请求过多，丢弃本次透传');
+    return;
+  }
 
   const timer = setTimeout(() => {
-    pendingUpstream.delete(key);
+    pendingUpstream.delete(upstreamId);
   }, 5000);
 
-  pendingUpstream.set(key, { rinfo, dnsId, timer });
+  msg = Buffer.from(msg);
+  msg.writeUInt16BE(upstreamId, 0);
+
+  pendingUpstream.set(upstreamId, { rinfo, clientDnsId, timer });
   upstreamSocket.send(msg, 0, msg.length, 53, UPSTREAM_DNS);
 }
 
@@ -451,14 +699,14 @@ server.on('message', async (msg, rinfo) => {
 
   if (req.qtype !== 1 && req.qtype !== 28) {
     console.log(`[x] 不支持的查询类型 ${typeStr}，返回空回答`);
-    server.send(buildResponse(req, []), rinfo.port, rinfo.address);
+    sendToClient(buildResponse(req, []), rinfo, `${cleanName} ${typeStr}`);
     return;
   }
 
   const cached = cacheGet(cleanName, req.qtype);
   if (cached) {
     console.log(`[c] 缓存命中: ${cached.join(', ')}`);
-    server.send(buildResponse(req, cached), rinfo.port, rinfo.address);
+    sendToClient(buildResponse(req, cached), rinfo, `${cleanName} ${typeStr}`);
     return;
   }
 
@@ -470,15 +718,15 @@ server.on('message', async (msg, rinfo) => {
     } else {
       console.log(`[!] DoH 无记录`);
     }
-    server.send(buildResponse(req, ips), rinfo.port, rinfo.address);
+    sendToClient(buildResponse(req, ips), rinfo, `${cleanName} ${typeStr}`);
   } catch (e) {
     console.error(`[!] DoH 查询失败: ${e.message}`);
     const stale = cache.get(cacheKey(cleanName, req.qtype));
     if (stale) {
       console.log(`[!] 使用过期缓存: ${stale.data.join(', ')}`);
-      server.send(buildResponse(req, stale.data), rinfo.port, rinfo.address);
+      sendToClient(buildResponse(req, stale.data), rinfo, `${cleanName} ${typeStr}`);
     } else {
-      server.send(buildResponse(req, []), rinfo.port, rinfo.address);
+      sendToClient(buildResponse(req, []), rinfo, `${cleanName} ${typeStr}`);
     }
   }
 });
@@ -490,6 +738,7 @@ server.on('error', (err) => {
 
 server.on('listening', () => {
   const addr = server.address();
+  fs.writeFileSync(PID_FILE, String(process.pid));
   console.log('');
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║           Super DNS 本地代理服务 v2          ║');
@@ -499,15 +748,15 @@ server.on('listening', () => {
   console.log(`[*] 缓存: ${CACHE_TTL_MS / 1000}s`);
   console.log(`[*] 上游 DNS: ${UPSTREAM_DNS}`);
   console.log(`[*] 配置: ${DOMAINS_FILE}`);
+  console.log(`[*] PID:  ${PID_FILE}`);
   console.log('');
 
-  // 设置系统 DNS 为本地代理
   try {
-    execSync(`networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.2`, { timeout: 10000 });
-    console.log(`[*] 已将 ${NETWORK_INTERFACE} DNS 设置为 127.0.0.2`);
+    execSync(`networksetup -setdnsservers "${NETWORK_INTERFACE}" ${HOST}`, { timeout: 10000 });
+    console.log(`[*] 已将 ${NETWORK_INTERFACE} DNS 设置为 ${HOST}`);
   } catch (e) {
     console.error(`[!] 设置系统 DNS 失败: ${e.message}`);
-    console.error(`[!] 请手动执行: sudo networksetup -setdnsservers "${NETWORK_INTERFACE}" 127.0.0.2`);
+    console.error(`[!] 请手动执行: sudo networksetup -setdnsservers "${NETWORK_INTERFACE}" ${HOST}`);
   }
   console.log('');
 });
@@ -525,6 +774,7 @@ function shutdown(signal) {
 
   // 关闭上游 socket
   try { upstreamSocket.close(); } catch (_) { /* ignore */ }
+  try { fs.unlinkSync(PID_FILE); } catch (_) { /* ignore */ }
 
   // 关闭 DNS 服务器
   server.close(() => {
@@ -538,7 +788,6 @@ function shutdown(signal) {
   } catch (e) {
     console.error(`[!] 恢复系统 DNS 失败: ${e.message}`);
     console.error(`[!] 请手动执行: sudo networksetup -setdnsservers "${NETWORK_INTERFACE}" Empty`);
-    console.error(`    或: networksetup -setdnsservers "${NETWORK_INTERFACE}" <原来的DNS>`);
   }
 
   console.log('[*] 已关闭');
@@ -548,13 +797,16 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-// 提权（如需要）
-ensureRoot();
+function runService() {
+  installServiceLogger();
+  NETWORK_INTERFACE = getActiveInterface();
+  UPSTREAM_DNS = getUpstreamDNS(NETWORK_INTERFACE);
+  domainRules = loadDomains(DOMAINS_FILE);
+  server.bind(PORT, HOST);
+}
 
-// 确保 127.0.0.2 loopback 别名存在（macOS 默认不启用）
-try {
-  execSync('ifconfig lo0 alias 127.0.0.2 2>/dev/null; true', { timeout: 5000 });
-} catch (_) { /* ignore */ }
-
-// 启动
-server.bind(PORT, HOST);
+if (process.env.SUPER_DNS_SERVICE === '1') {
+  runService();
+} else {
+  runCli();
+}
