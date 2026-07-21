@@ -1,100 +1,77 @@
 # Super DNS
 
-系统级 DNS 代理，白名单域名通过阿里云 DoH (DNS over HTTPS) 解析防劫持，其余域名 UDP 透传到上游 DNS。
+本机 hosts 维护守护进程。程序以 root 常驻运行，定时通过阿里云 DoH 查询配置域名的 A 记录，并维护 `/etc/hosts` 中由 super-dns 管理的区块。
 
-## 特性
-
-- 白名单域名走阿里云 DoH，防 DNS 劫持
-- 非白名单域名 UDP 原样透传上游 DNS，不影响正常解析
-- 支持通配符配置（如 `*.qzz.io` 接管整个域）
-- 5 分钟本地缓存，减少重复查询
-- 自动设置/恢复系统 DNS（通过 networksetup）
-- 直接监听本机 DNS 端口，避免 pf loopback 转发问题
-- 零依赖，纯 Node.js 实现
-
-## 快速开始
+## 启动
 
 ```bash
-# 交互菜单：根据服务状态显示启动或关闭选项
-npm start
-# 或
-super-dns
-
-# 直接启动/关闭
-super-dns start
-super-dns end
+sudo node index.js
 ```
 
-启动时需要一次管理员授权（macOS GUI 密码框），用于：
-1. 启动 root 子进程监听 `127.0.0.1:53`
-2. 设置系统 DNS 为 `127.0.0.1`
+推荐交给 pm2 管理 root 常驻进程。程序自身不再提供 `start/end` 命令和菜单。
 
-> 服务直接监听系统 DNS 端口 53，不再依赖 pf loopback 端口转发。
+重复启动时，如果检测到同一个 `index.js` 已在运行，会输出：
 
-### 菜单行为
-
-- 服务未运行时：默认选中 `启动服务`，第二项是 `退出`
-- 服务正在运行时：默认选中 `关闭服务`，第二项是 `退出`
-- 方向键切换，Enter 确认，`q` 退出
-
-## 配置域名
-
-编辑 `~/.config/super-dns/domains`，每行一个域名：
-
+```text
+已经在运行了
 ```
-# 通配符：接管 qzz.io 及所有子域名
+
+## 配置
+
+域名列表：
+
+```text
+~/.config/super-dns/domains
+```
+
+示例：
+
+```text
+perf.qzz.io
+api.qzz.io
 *.qzz.io
-
-# 精确匹配：只接管这一个域名
-example.com
 ```
 
-支持 `#` 开头的注释行。
+当前 hosts 模式只会写入精确域名。通配符规则会被加载并记录日志，但不会写入 `/etc/hosts`，因为 hosts 不支持通配符。
 
-## 测试
+## 工作方式
 
-```bash
-# 直接测试代理
-dig @127.0.0.1 perf.qzz.io A +short
-dig @127.0.0.1 baidu.com A +short
+程序只维护 `/etc/hosts` 中这一段：
 
-# 测试系统 DNS 解析
-ping perf.qzz.io
-curl http://perf.qzz.io:1314/
+```text
+# BEGIN super-dns
+221.223.177.133 perf.qzz.io
+# END super-dns
 ```
+
+每次更新流程：
+
+1. 读取 `~/.config/super-dns/domains`
+2. 跳过通配符，保留精确域名
+3. 通过 DoH 查询 A 记录
+4. 结果变化时更新 `/etc/hosts`
+5. 执行 `dscacheutil -flushcache`
+6. 执行 `killall -HUP mDNSResponder`
+
+默认每 300 秒轮询一次。配置文件发生变化后，会立即触发一次更新。
 
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `PORT` | `53` | DNS 代理监听端口 |
-| `DOH_BASE` | `https://dns.alidns.com/resolve` | DoH 服务地址 |
-| `CACHE_TTL` | `300000` | 缓存时间（毫秒），默认 5 分钟 |
-| `UPSTREAM_DNS` | 自动检测 | 上游 DNS 服务器（非白名单域名透传目标） |
-| `NETWORK_INTERFACE` | 自动检测 | 网络接口名（如 Wi-Fi、Ethernet） |
+| `DOH_BASE` | `https://dns.alidns.com/resolve` | DoH 查询地址 |
+| `POLL_INTERVAL` | `300000` | 轮询间隔，单位毫秒 |
 
-## 工作原理
+## 日志
 
-1. 通过 osascript 弹框获取一次性管理员授权
-2. root 子进程监听 `127.0.0.1:53` (UDP)
-3. 设置系统 DNS 为 `127.0.0.1`（通过 networksetup）
-4. 命中白名单的域名 → 阿里云 DoH 解析 → 缓存 → 返回
-5. 未命中的域名 → UDP 原样转发到上游 DNS → 返回
-6. 退出时自动恢复系统 DNS
+日志路径：
 
-## 退出清理
-
-- `super-dns end` 关闭后台服务并恢复系统 DNS
-- 自动恢复系统 DNS：`networksetup -setdnsservers <iface> Empty`
-- PID 文件：`/tmp/super-dns.pid`
-- 日志文件：`/tmp/super-dns.log`，最多保留 500 行
-
-## 手动清理
-
-如果进程异常退出（未触发清理逻辑），手动执行：
-
-```bash
-# 恢复 DNS
-sudo networksetup -setdnsservers Wi-Fi Empty
-
+```text
+/tmp/super-dns.log
 ```
+
+最多保留 500 行。
+
+## 停止
+
+使用进程管理器停止即可，例如 pm2 stop。程序收到 `SIGINT` 或 `SIGTERM` 后，会清理 `/etc/hosts` 中的 super-dns 区块并刷新 DNS 缓存。
