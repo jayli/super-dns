@@ -212,7 +212,6 @@ upstreamSocket.on('message', (msg) => {
   for (const [key, entry] of pendingUpstream) {
     if (entry.dnsId === dnsId) {
       clearTimeout(entry.timer);
-      console.log(`[>] 上游响应 relay dnsId=${dnsId.toString(16)} → ${entry.rinfo.address}:${entry.rinfo.port}`);
       server.send(msg, entry.rinfo.port, entry.rinfo.address);
       pendingUpstream.delete(key);
       return;
@@ -471,9 +470,7 @@ server.on('message', async (msg, rinfo) => {
     } else {
       console.log(`[!] DoH 无记录`);
     }
-    const resp = buildResponse(req, ips);
-    console.log(`[>] 发送 DoH 响应 dnsId=${req.id.toString(16)} → ${rinfo.address}:${rinfo.port} ips=[${ips}]`);
-    server.send(resp, rinfo.port, rinfo.address);
+    server.send(buildResponse(req, ips), rinfo.port, rinfo.address);
   } catch (e) {
     console.error(`[!] DoH 查询失败: ${e.message}`);
     const stale = cache.get(cacheKey(cleanName, req.qtype));
