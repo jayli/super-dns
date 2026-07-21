@@ -234,68 +234,12 @@ function forwardToUpstream(msg, rinfo) {
 // ============================================================
 // DoH 查询 (阿里云公共 DNS)
 // ============================================================
-const dohUrl = new URL(DOH_BASE);
-const dohHost = dohUrl.hostname;
-let dohIpCache = null;
-
-// 通过上游 DNS 解析 DoH 服务器 IP，避免循环依赖（系统 DNS 指向自身）
-function resolveDohIp() {
-  if (dohIpCache) return Promise.resolve(dohIpCache);
-
-  return new Promise((resolve, reject) => {
-    const id = Math.floor(Math.random() * 65536);
-    const header = Buffer.alloc(12);
-    header.writeUInt16BE(id, 0);
-    header.writeUInt16BE(0x0100, 2);
-    header.writeUInt16BE(1, 4);
-
-    const question = Buffer.concat([
-      encodeName(dohHost),
-      Buffer.from([0x00, 0x01, 0x00, 0x01])
-    ]);
-    const query = Buffer.concat([header, question]);
-
-    const sock = dgram.createSocket('udp4');
-    const timer = setTimeout(() => { sock.close(); reject(new Error('DoH DNS 超时')); }, 3000);
-
-    sock.on('message', (msg) => {
-      clearTimeout(timer);
-      sock.close();
-      const respId = msg.readUInt16BE(0);
-      const anCount = msg.readUInt16BE(6);
-      if (respId !== id || anCount === 0) { reject(new Error('DoH DNS 无记录')); return; }
-
-      const { nextOffset } = readName(msg, 12);
-      let off = nextOffset + 4; // 跳过 QTYPE+QCLASS
-      const nameResult = readName(msg, off);
-      off = nameResult.nextOffset + 8; // TYPE(2)+CLASS(2)+TTL(4)
-      const rdLen = msg.readUInt16BE(off); // RDLENGTH(2)
-      const rdata = msg.slice(off + 2, off + 2 + rdLen);
-
-      if (rdata.length === 4) {
-        dohIpCache = Array.from(rdata).join('.');
-        resolve(dohIpCache);
-      } else {
-        reject(new Error('DoH DNS 非 IPv4'));
-      }
-    });
-
-    sock.send(query, 0, query.length, 53, UPSTREAM_DNS);
-  });
-}
-
+// https.get 内部 dns.lookup 会走系统 DNS → 127.0.0.1 → 代理不匹配白名单 → 透传到上游
 function dohQuery(name, type) {
-  return resolveDohIp().then(dohIp => new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const qtype = type === 28 ? 'AAAA' : 'A';
-    const req = https.request({
-      hostname: dohIp,
-      port: 443,
-      path: `${dohUrl.pathname}?name=${encodeURIComponent(name)}&type=${qtype}`,
-      method: 'GET',
-      servername: dohHost,
-      timeout: 3000,
-      headers: { Host: dohHost }
-    }, (res) => {
+    const url = `${DOH_BASE}?name=${encodeURIComponent(name)}&type=${qtype}`;
+    const req = https.get(url, { timeout: 5000 }, (res) => {
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
@@ -311,8 +255,7 @@ function dohQuery(name, type) {
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('DoH 超时')); });
-    req.end();
-  }));
+  });
 }
 
 // ============================================================
@@ -463,14 +406,7 @@ function buildResponse(req, ips) {
     qdCount[2] = 0; qdCount[3] = 0;
   }
 
-  const full = Buffer.concat([id, flags, qdCount, question, ...answers]);
-  // DEBUG: check actual IP bytes in answer
-  if (answers.length > 0) {
-    const ansHex = [];
-    for (let i = 0; i < answers[0].length; i++) ansHex.push(answers[0][i].toString(16).padStart(2, '0'));
-    console.log(`[DEBUG] buildResponse answer hex: ${ansHex.join(' ')}`);
-  }
-  return full;
+  return Buffer.concat([id, flags, qdCount, question, ...answers]);
 }
 
 // ============================================================
@@ -534,14 +470,7 @@ server.on('message', async (msg, rinfo) => {
     } else {
       console.log(`[!] DoH 无记录`);
     }
-    // 用 debug 脚本检查实际发出的报文
-    const response = buildResponse(req, ips);
-    // DEBUG: hex dump of the IP portion
-    const dbg = [];
-    for (let i = 0; i < response.length; i++) dbg.push(response[i].toString(16).padStart(2, '0'));
-    console.log(`[DEBUG] response hex (${response.length}B): ${dbg.join(' ')}`);
-    console.log(`[DEBUG] ips passed to buildResponse: [${ips}]`);
-    server.send(response, rinfo.port, rinfo.address);
+    server.send(buildResponse(req, ips), rinfo.port, rinfo.address);
   } catch (e) {
     console.error(`[!] DoH 查询失败: ${e.message}`);
     const stale = cache.get(cacheKey(cleanName, req.qtype));
